@@ -17,7 +17,19 @@ from __future__ import annotations
 import pytest
 
 from rag_agent.agent.state import ChunkMetadata, DocumentChunk
+from rag_agent.config import Settings
 from rag_agent.vectorstore.store import VectorStoreManager
+
+
+def build_test_settings(tmp_path, threshold: float = 0.15) -> Settings:
+    chroma_path = tmp_path / "chroma_db"
+    return Settings(
+        _env_file=None,
+        CHROMA_DB_PATH=str(chroma_path),
+        CHROMA_COLLECTION_NAME=f"test_collection_{tmp_path.name}",
+        SIMILARITY_THRESHOLD=threshold,
+        RETRIEVAL_K=4,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +78,52 @@ def bonus_chunk() -> DocumentChunk:
             "a generator that produces synthetic data and a discriminator that "
             "distinguishes real from generated samples. Training is a minimax game."
         ),
+        metadata=metadata,
+    )
+
+
+@pytest.fixture
+def comparison_chunk() -> DocumentChunk:
+    metadata = ChunkMetadata(
+        topic="RNN",
+        difficulty="intermediate",
+        type="comparison",
+        source="test_rnn.md",
+        related_topics=["LSTM", "sequence_modeling"],
+        is_bonus=False,
+    )
+    text = (
+        "Standard recurrent neural networks maintain a hidden state across time "
+        "steps, but they often struggle with vanishing gradients on long "
+        "sequences. This makes it harder for them to preserve information over "
+        "many steps compared with gated recurrent architectures."
+    )
+    return DocumentChunk(
+        chunk_id=VectorStoreManager.generate_chunk_id("test_rnn.md", text),
+        chunk_text=text,
+        metadata=metadata,
+    )
+
+
+@pytest.fixture
+def secondary_lstm_chunk() -> DocumentChunk:
+    metadata = ChunkMetadata(
+        topic="LSTM",
+        difficulty="advanced",
+        type="architecture",
+        source="test_lstm_advanced.md",
+        related_topics=["RNN", "cell_state"],
+        is_bonus=False,
+    )
+    text = (
+        "The forget gate, input gate, and output gate in an LSTM regulate how "
+        "information moves through the cell state. This gating structure helps "
+        "the model preserve relevant information and mitigate vanishing "
+        "gradients during long sequence processing."
+    )
+    return DocumentChunk(
+        chunk_id=VectorStoreManager.generate_chunk_id("test_lstm_advanced.md", text),
+        chunk_text=text,
         metadata=metadata,
     )
 
@@ -121,24 +179,27 @@ class TestDuplicateDetection:
         self, tmp_path, sample_chunk: DocumentChunk
     ) -> None:
         """A chunk that has never been ingested must not be flagged as duplicate."""
-        # TODO: implement using a test ChromaDB path in tmp_path
-        # store = VectorStoreManager(settings=test_settings(chroma_db_path=tmp_path))
-        # assert store.check_duplicate(sample_chunk.chunk_id) is False
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store = VectorStoreManager(settings=build_test_settings(tmp_path))
+        assert store.check_duplicate(sample_chunk.chunk_id) is False
 
     def test_ingested_chunk_is_duplicate(
         self, tmp_path, sample_chunk: DocumentChunk
     ) -> None:
         """A chunk that has been ingested must be flagged as duplicate on re-check."""
-        # TODO: ingest chunk, then check_duplicate → True
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store = VectorStoreManager(settings=build_test_settings(tmp_path))
+        store.ingest([sample_chunk])
+        assert store.check_duplicate(sample_chunk.chunk_id) is True
 
     def test_ingestion_skips_duplicate(
         self, tmp_path, sample_chunk: DocumentChunk
     ) -> None:
         """Ingesting the same chunk twice must result in skipped=1 on second call."""
-        # TODO: ingest once, ingest again, check IngestionResult.skipped == 1
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store = VectorStoreManager(settings=build_test_settings(tmp_path))
+        first_result = store.ingest([sample_chunk])
+        second_result = store.ingest([sample_chunk])
+
+        assert first_result.ingested == 1
+        assert second_result.skipped == 1
 
 
 # ---------------------------------------------------------------------------
@@ -158,19 +219,29 @@ class TestRetrieval:
         self, tmp_path, sample_chunk: DocumentChunk
     ) -> None:
         """A query semantically similar to an ingested chunk must return results."""
-        # TODO: ingest sample_chunk, query "LSTM gate mechanism", assert len > 0
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store = VectorStoreManager(settings=build_test_settings(tmp_path))
+        store.ingest([sample_chunk])
 
-    def test_irrelevant_query_returns_empty(self, tmp_path) -> None:
+        results = store.query("LSTM gate mechanism and vanishing gradient")
+
+        assert len(results) > 0
+        assert results[0].metadata.topic == "LSTM"
+
+    def test_irrelevant_query_returns_empty(
+        self, tmp_path, sample_chunk: DocumentChunk
+    ) -> None:
         """
         A query with no semantic similarity to the corpus must return empty list.
 
         This tests the hallucination guard threshold. The system must return
         an empty list — not low-quality chunks — when nothing matches.
         """
-        # TODO: ingest sample_chunk, query "history of the roman empire"
-        # assert result == []
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store = VectorStoreManager(settings=build_test_settings(tmp_path))
+        store.ingest([sample_chunk])
+
+        results = store.query("history of the roman empire")
+
+        assert results == []
 
     def test_topic_filter_restricts_results(
         self,
@@ -179,13 +250,30 @@ class TestRetrieval:
         bonus_chunk: DocumentChunk,
     ) -> None:
         """Results with topic_filter='LSTM' must not include GAN chunks."""
-        # TODO: ingest both chunks, query with topic_filter="LSTM"
-        # assert all(c.metadata.topic == "LSTM" for c in results)
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store = VectorStoreManager(settings=build_test_settings(tmp_path))
+        store.ingest([sample_chunk, bonus_chunk])
+
+        results = store.query(
+            "LSTM vanishing gradient gate mechanism",
+            topic_filter="LSTM",
+        )
+
+        assert results
+        assert all(chunk.metadata.topic == "LSTM" for chunk in results)
 
     def test_results_sorted_by_score_descending(
-        self, tmp_path, sample_chunk: DocumentChunk
+        self,
+        tmp_path,
+        sample_chunk: DocumentChunk,
+        secondary_lstm_chunk: DocumentChunk,
+        comparison_chunk: DocumentChunk,
     ) -> None:
         """Retrieved chunks must be sorted with highest similarity first."""
-        # TODO: ingest multiple chunks, verify scores are non-increasing
-        pytest.skip("Implement after VectorStoreManager is complete")
+        store = VectorStoreManager(settings=build_test_settings(tmp_path))
+        store.ingest([comparison_chunk, sample_chunk, secondary_lstm_chunk])
+
+        results = store.query("LSTM forget gate cell state vanishing gradient")
+
+        assert len(results) >= 2
+        scores = [chunk.score for chunk in results]
+        assert scores == sorted(scores, reverse=True)

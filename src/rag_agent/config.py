@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from enum import Enum
 from functools import lru_cache
+import hashlib
+import math
+import os
+import re
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import Field
@@ -113,6 +117,59 @@ def get_settings() -> Settings:
     return Settings()
 
 
+class SimpleHashEmbeddings:
+    """A no-download fallback embedding model using hashed token counts."""
+
+    def __init__(self, dimensions: int = 2048) -> None:
+        self._dimensions = dimensions
+
+    def _embed(self, text: str) -> list[float]:
+        vector = [0.0] * self._dimensions
+        tokens = re.findall(r"[a-zA-Z0-9_]+", text.lower())
+        if not tokens:
+            return vector
+
+        features = tokens + [
+            f"{first}_{second}" for first, second in zip(tokens, tokens[1:])
+        ]
+        for token in features:
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:8], "big") % self._dimensions
+            vector[index] += 1.0
+
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm == 0:
+            return vector
+
+        return [value / norm for value in vector]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text)
+
+
+class ResilientEmbeddings:
+    """Wrap a primary embedding backend with a deterministic local fallback."""
+
+    def __init__(self, primary, fallback) -> None:
+        self._primary = primary
+        self._fallback = fallback
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        try:
+            return self._primary.embed_documents(texts)
+        except Exception:
+            return self._fallback.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        try:
+            return self._primary.embed_query(text)
+        except Exception:
+            return self._fallback.embed_query(text)
+
+
 # ---------------------------------------------------------------------------
 # LLM Factory
 # ---------------------------------------------------------------------------
@@ -175,8 +232,20 @@ class LLMFactory:
         Interview talking point: Groq uses LPU (Language Processing Unit)
         inference for significantly lower latency than GPU-based inference.
         """
-        # TODO: implement using langchain_groq.ChatGroq
-        raise NotImplementedError
+        from langchain_groq import ChatGroq
+
+        if (
+            not self._settings.groq_api_key
+            or self._settings.groq_api_key == "your_groq_api_key_here"
+        ):
+            raise EnvironmentError(
+                "GROQ_API_KEY is missing. Add it to your .env file before using Groq."
+            )
+
+        return ChatGroq(
+            api_key=self._settings.groq_api_key,
+            model_name=self._settings.groq_model,
+        )
 
     def _create_ollama(self) -> BaseChatModel:
         """
@@ -188,8 +257,12 @@ class LLMFactory:
         Interview talking point: local inference eliminates data privacy
         concerns and removes API cost and latency entirely.
         """
-        # TODO: implement using langchain_ollama.ChatOllama
-        raise NotImplementedError
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            base_url=self._settings.ollama_base_url,
+            model=self._settings.ollama_model,
+        )
 
     def _create_lmstudio(self) -> BaseChatModel:
         """
@@ -205,8 +278,13 @@ class LLMFactory:
         OpenAI-native tooling to work with self-hosted models without
         code changes — just a base_url swap.
         """
-        # TODO: implement using langchain_openai.ChatOpenAI with base_url override
-        raise NotImplementedError
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY", "lm-studio"),
+            base_url=self._settings.lmstudio_base_url,
+            model=self._settings.lmstudio_model,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +343,15 @@ class EmbeddingFactory:
         Interview talking point: local embeddings mean the corpus content
         never leaves the machine — important for proprietary datasets.
         """
-        # TODO: implement using langchain_community.embeddings.HuggingFaceEmbeddings
-        raise NotImplementedError
+        fallback = SimpleHashEmbeddings()
+
+        try:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+
+            primary = HuggingFaceEmbeddings(model_name=self._settings.embedding_model)
+            return ResilientEmbeddings(primary=primary, fallback=fallback)
+        except Exception:
+            return fallback
 
     def _create_openai(self):
         """
@@ -275,5 +360,15 @@ class EmbeddingFactory:
         Requires OPENAI_API_KEY. Higher quality than local models
         but incurs API cost per embedding call.
         """
-        # TODO: implement using langchain_openai.OpenAIEmbeddings
-        raise NotImplementedError
+        from langchain_openai import OpenAIEmbeddings
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise EnvironmentError(
+                "OPENAI_API_KEY is missing. Set it before using OpenAI embeddings."
+            )
+
+        return OpenAIEmbeddings(
+            api_key=api_key,
+            model="text-embedding-3-small",
+        )
